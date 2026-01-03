@@ -1,0 +1,1123 @@
+import 'package:flutter/material.dart';
+import 'dart:convert';
+import 'dart:async';
+import '../services/auth_service.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:intl/intl.dart';
+import '../services/notification_service.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+import '../utils/date_time_formatter.dart';
+import 'guard_current_visitors_screen.dart';
+import 'guard_entry_logs_screen.dart';
+import 'guard_building_visitors_screen.dart';
+
+class GuardHomeScreen extends StatefulWidget {
+  const GuardHomeScreen({super.key});
+
+  @override
+  State<GuardHomeScreen> createState() => _GuardHomeScreenState();
+}
+
+class _GuardHomeScreenState extends State<GuardHomeScreen> {
+  final AuthService _authService = AuthService();
+  final NotificationService _notificationService = NotificationService();
+  final FlutterLocalNotificationsPlugin _flutterLocalNotificationsPlugin =
+      FlutterLocalNotificationsPlugin();
+  Map<String, dynamic>? guardData;
+  bool isLoading = true;
+  Set<String> _notifiedAlertIds = {}; // Track already notified alerts
+  Timer? _panicNotificationTimer;
+  bool _isPanicNotificationActive = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeGuardData();
+  }
+
+  Future<void> _initializeGuardData() async {
+    await _loadGuardData();
+    _setupNotifications();
+    _listenForResidentPanicAlerts();
+    _listenForGuardPanicAlerts();
+  }
+
+  Future<void> _loadGuardData() async {
+    final data = await _authService.getResidentData();
+    setState(() {
+      guardData = data;
+      isLoading = false;
+    });
+  }
+
+  Future<void> _setupNotifications() async {
+    if (guardData != null && guardData!['apartmentName'] != null) {
+      String apartmentId = guardData!['apartmentName']
+          .toString()
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]'), '');
+      await _notificationService.subscribeToTopic('guards_$apartmentId');
+    }
+
+    // Initialize local notifications for resident panic alerts
+    const AndroidInitializationSettings initializationSettingsAndroid =
+        AndroidInitializationSettings('@mipmap/ic_launcher');
+
+    const InitializationSettings initializationSettings =
+        InitializationSettings(android: initializationSettingsAndroid);
+
+    await _flutterLocalNotificationsPlugin.initialize(
+      initializationSettings,
+      onDidReceiveNotificationResponse: _onNotificationTap,
+    );
+  }
+
+  void _onNotificationTap(NotificationResponse notificationResponse) {
+    final String? payload = notificationResponse.payload;
+    if (payload != null) {
+      try {
+        final Map<String, dynamic> data = jsonDecode(payload);
+        final String? type = data['type'];
+        final String? alertId = data['alertId'];
+
+        if (type == 'resident_panic') {
+          // Stop the repeating notifications
+          _stopPanicNotifications();
+          // Navigate to resident panic alerts screen
+          Navigator.pushNamed(context, '/guard_resident_panic_alerts');
+        } else if (type == 'guard_panic') {
+          // Stop the repeating notifications
+          _stopPanicNotifications();
+          // Navigate to panic alerts screen
+          Navigator.pushNamed(context, '/guard_panic_alerts');
+        }
+      } catch (e) {
+        debugPrint('Error parsing notification payload: $e');
+      }
+    }
+  }
+
+  void _listenForResidentPanicAlerts() {
+    if (guardData == null || guardData!['apartmentName'] == null) return;
+
+    String apartmentId = guardData!['apartmentName']
+        .toString()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+    FirebaseFirestore.instance
+        .collection('apartments')
+        .doc(apartmentId)
+        .collection('resident_panic_alerts')
+        .where('status', isEqualTo: 'active')
+        .orderBy('timestamp', descending: true)
+        .snapshots()
+        .listen((snapshot) async {
+          for (var doc in snapshot.docs) {
+            final alertId = doc.id;
+            if (!_notifiedAlertIds.contains(alertId)) {
+              // New alert - show notification
+              _notifiedAlertIds.add(alertId);
+              final alert = doc.data();
+              if (alert != null) {
+                // Add the document ID to the alert data for notification payload
+                alert['id'] = alertId;
+                await _showResidentPanicNotification(alert);
+              }
+            }
+          }
+        });
+  }
+
+  void _listenForGuardPanicAlerts() {
+    if (guardData == null || guardData!['apartmentName'] == null) return;
+
+    String apartmentId = guardData!['apartmentName']
+        .toString()
+        .toLowerCase()
+        .replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+    FirebaseFirestore.instance
+        .collection('apartments')
+        .doc(apartmentId)
+        .collection('panic_alerts')
+        .where('status', isEqualTo: 'active')
+        .orderBy('timestamp', descending: true)
+        .snapshots()
+        .listen((snapshot) async {
+          for (var doc in snapshot.docs) {
+            final alertId = doc.id;
+            // Use a different set for guard alerts to avoid conflicts
+            if (!_notifiedAlertIds.contains('guard_$alertId')) {
+              // New alert - show notification
+              _notifiedAlertIds.add('guard_$alertId');
+              final alert = doc.data();
+              if (alert != null) {
+                // Add the document ID to the alert data for notification payload
+                alert['id'] = alertId;
+                await _showGuardPanicNotification(alert);
+              }
+            }
+          }
+        });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: Theme.of(context).colorScheme.surface,
+      appBar: AppBar(
+        title: const Text('Security Guard'),
+        titleTextStyle: const TextStyle(
+          fontSize: 24,
+          fontWeight: FontWeight.bold,
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.logout, size: 28),
+            tooltip: 'Logout',
+            onPressed: _handleLogout,
+          ),
+        ],
+      ),
+      body: isLoading
+          ? const Center(child: CircularProgressIndicator())
+          : guardData == null
+          ? const Center(child: Text('Error loading data'))
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Guard Info Card
+                  Card(
+                    elevation: 2,
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
+                      child: Row(
+                        children: [
+                          CircleAvatar(
+                            radius: 30,
+                            backgroundColor: Colors.blue[700],
+                            child: const Icon(
+                              Icons.shield,
+                              size: 32,
+                              color: Colors.white,
+                            ),
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  'On Duty',
+                                  style: Theme.of(context).textTheme.bodyLarge
+                                      ?.copyWith(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.onSurfaceVariant,
+                                      ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  guardData!['residentName'],
+                                  style: Theme.of(
+                                    context,
+                                  ).textTheme.displayMedium,
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  guardData!['apartmentName'] ??
+                                      'Unknown Apartment',
+                                  style: Theme.of(context).textTheme.bodyLarge
+                                      ?.copyWith(fontWeight: FontWeight.w500),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Guard ID: ${guardData!['apartmentNumber']}',
+                                  style: Theme.of(context).textTheme.bodyLarge
+                                      ?.copyWith(
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  const SizedBox(height: 30),
+
+                  // Active Emergency Alerts Section
+                  StreamBuilder<QuerySnapshot>(
+                    stream:
+                        guardData != null && guardData!['apartmentName'] != null
+                        ? FirebaseFirestore.instance
+                              .collection('apartments')
+                              .doc(
+                                guardData!['apartmentName']
+                                    .toString()
+                                    .toLowerCase()
+                                    .replaceAll(RegExp(r'[^a-z0-9]'), ''),
+                              )
+                              .collection('resident_panic_alerts')
+                              .where('status', isEqualTo: 'active')
+                              .orderBy('timestamp', descending: true)
+                              .snapshots()
+                        : const Stream.empty(),
+                    builder: (context, snapshot) {
+                      if (snapshot.hasError) {
+                        return const SizedBox.shrink();
+                      }
+
+                      if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+                        return const SizedBox.shrink();
+                      }
+
+                      final alerts = snapshot.data!.docs;
+
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '🚨 Active Emergency Alerts',
+                            style: Theme.of(context).textTheme.displayMedium
+                                ?.copyWith(
+                                  color: Colors.red,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                          ),
+                          const SizedBox(height: 16),
+                          ...alerts.map((doc) {
+                            final alert = doc.data() as Map<String, dynamic>;
+                            return Card(
+                              elevation: 6,
+                              margin: const EdgeInsets.only(bottom: 16),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(16),
+                                side: BorderSide(
+                                  color: Colors.orange.shade300,
+                                  width: 3,
+                                ),
+                              ),
+                              color: Colors.transparent,
+                              child: Padding(
+                                padding: const EdgeInsets.all(16),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Icon(
+                                          Icons.warning,
+                                          color: Colors.red[700],
+                                          size: 32,
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                'EMERGENCY ALERT',
+                                                style: TextStyle(
+                                                  fontSize: 18,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: Colors.red[700],
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                'From: ${alert['residentName']} (Apt ${alert['apartmentNumber']})',
+                                                style: TextStyle(
+                                                  fontSize: 16,
+                                                  color: Colors.grey[800],
+                                                  fontWeight: FontWeight.w500,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                'Time: ${DateTimeFormatter.formatDateTime((alert['timestamp'] as Timestamp?)!.toDate())}',
+                                                style: TextStyle(
+                                                  fontSize: 14,
+                                                  color: Colors.grey[800],
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 16),
+                                    Row(
+                                      mainAxisAlignment: MainAxisAlignment.end,
+                                      children: [
+                                        FilledButton.icon(
+                                          onPressed: () =>
+                                              _acknowledgeAlert(doc.id),
+                                          icon: const Icon(Icons.check),
+                                          label: const Text('Acknowledge'),
+                                          style: FilledButton.styleFrom(
+                                            backgroundColor: Colors.green,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          }),
+                          const SizedBox(height: 30),
+                        ],
+                      );
+                    },
+                  ),
+
+                  // Active Guard Emergency Alerts Section
+                  StreamBuilder<QuerySnapshot>(
+                    stream:
+                        guardData != null && guardData!['apartmentName'] != null
+                        ? FirebaseFirestore.instance
+                              .collection('apartments')
+                              .doc(
+                                guardData!['apartmentName']
+                                    .toString()
+                                    .toLowerCase()
+                                    .replaceAll(RegExp(r'[^a-z0-9]'), ''),
+                              )
+                              .collection('panic_alerts')
+                              .where('status', isEqualTo: 'active')
+                              .orderBy('timestamp', descending: true)
+                              .snapshots()
+                        : const Stream.empty(),
+                    builder: (context, snapshot) {
+                      if (snapshot.hasError) {
+                        return const SizedBox.shrink();
+                      }
+
+                      if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
+                        return const SizedBox.shrink();
+                      }
+
+                      final alerts = snapshot.data!.docs;
+
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            '🚨 Active Security Emergency Alerts',
+                            style: Theme.of(context).textTheme.displayMedium
+                                ?.copyWith(
+                                  color: Colors.red,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                          ),
+                          const SizedBox(height: 16),
+                          ...alerts.map((doc) {
+                            final alert = doc.data() as Map<String, dynamic>;
+                            return Card(
+                              elevation: 6,
+                              margin: const EdgeInsets.only(bottom: 16),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(16),
+                                side: BorderSide(
+                                  color: Colors.red.shade300,
+                                  width: 3,
+                                ),
+                              ),
+                              color: Colors.transparent,
+                              child: Padding(
+                                padding: const EdgeInsets.all(16),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Row(
+                                      children: [
+                                        Icon(
+                                          Icons.warning,
+                                          color: Colors.red[700],
+                                          size: 32,
+                                        ),
+                                        const SizedBox(width: 12),
+                                        Expanded(
+                                          child: Column(
+                                            crossAxisAlignment:
+                                                CrossAxisAlignment.start,
+                                            children: [
+                                              Text(
+                                                'SECURITY EMERGENCY',
+                                                style: TextStyle(
+                                                  fontSize: 18,
+                                                  fontWeight: FontWeight.bold,
+                                                  color: Colors.red[700],
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                'From: ${alert['guardName']} (Security)',
+                                                style: TextStyle(
+                                                  fontSize: 16,
+                                                  color: Colors.grey[800],
+                                                  fontWeight: FontWeight.w500,
+                                                ),
+                                              ),
+                                              const SizedBox(height: 4),
+                                              Text(
+                                                'Time: ${DateTimeFormatter.formatDateTime((alert['timestamp'] as Timestamp?)!.toDate())}',
+                                                style: TextStyle(
+                                                  fontSize: 14,
+                                                  color: Colors.grey[800],
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    const SizedBox(height: 16),
+                                    Row(
+                                      mainAxisAlignment: MainAxisAlignment.end,
+                                      children: [
+                                        FilledButton.icon(
+                                          onPressed: () =>
+                                              _resolveGuardAlert(doc.id),
+                                          icon: const Icon(Icons.check),
+                                          label: const Text('Resolve'),
+                                          style: FilledButton.styleFrom(
+                                            backgroundColor: Colors.green,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ),
+                            );
+                          }),
+                          const SizedBox(height: 30),
+                        ],
+                      );
+                    },
+                  ),
+
+                  Text(
+                    'Visitor Verification',
+                    style: Theme.of(context).textTheme.displayMedium,
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // Scan QR Code Button
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.qr_code_scanner,
+                    title: 'Scan QR Code',
+                    subtitle: 'Scan visitor QR code to verify',
+                    color: Colors.blue,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_scanner');
+                    },
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // Enter OTP Button
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.dialpad,
+                    title: 'Enter OTP',
+                    subtitle: 'Manually enter delivery OTP',
+                    color: Colors.orange,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_otp_entry');
+                    },
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // Surprise Visitor Button
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.person_add_alt,
+                    title: 'Surprise Visitor',
+                    subtitle: 'Request approval for unexpected guest',
+                    color: Colors.purple,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_surprise_visitor');
+                    },
+                  ),
+
+                  const SizedBox(height: 30),
+
+                  Text(
+                    'Logs & Reports',
+                    style: Theme.of(context).textTheme.displayMedium,
+                  ),
+
+                  const SizedBox(height: 16),
+
+                  // Current Visitors
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.people,
+                    title: 'Current Visitors',
+                    subtitle: 'See who is inside the building',
+                    color: Colors.green,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_current_visitors');
+                    },
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // Entry Logs
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.history,
+                    title: 'Entry Logs',
+                    subtitle: 'View all visitor entries',
+                    color: Colors.teal,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_logs');
+                    },
+                  ),
+
+                  const SizedBox(height: 12),
+
+                  // Building Visitors
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.apartment,
+                    title: 'Building Visitors',
+                    subtitle: 'Manage multi-apartment access',
+                    color: Colors.teal,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_building_visitors');
+                    },
+
+                    // Panic Button
+                  ),
+                  const SizedBox(height: 30),
+                  Text(
+                    'Emergency',
+                    style: Theme.of(context).textTheme.displayMedium,
+                  ),
+                  const SizedBox(height: 16),
+                  // Panic Alerts
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.warning,
+                    title: 'Panic Alerts',
+                    subtitle: 'View resident panic alerts',
+                    color: Colors.red,
+                    onTap: () {
+                      Navigator.pushNamed(context, '/guard_panic_alerts');
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                  // Resident Panic Alerts
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.emergency,
+                    title: 'Resident Alerts',
+                    subtitle: 'Check resident emergency alerts',
+                    color: Colors.orange,
+                    onTap: () {
+                      Navigator.pushNamed(
+                        context,
+                        '/guard_resident_panic_alerts',
+                      );
+                    },
+                  ),
+                  _buildFeatureCard(
+                    context: context,
+                    icon: Icons.warning,
+                    title: 'Panic Button',
+                    subtitle: 'Alert administration',
+                    color: Colors.red,
+                    onTap: _showPanicConfirmation,
+                  ),
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _buildFeatureCard({
+    required BuildContext context,
+    required IconData icon,
+    required String title,
+    required String subtitle,
+    required Color color,
+    required VoidCallback onTap,
+  }) {
+    return Card(
+      elevation: 2,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(12),
+        side: BorderSide(color: color.withOpacity(0.3), width: 1),
+      ),
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(12),
+        child: Padding(
+          padding: const EdgeInsets.all(20),
+          child: Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(12),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(icon, size: 32, color: color),
+              ),
+              const SizedBox(width: 16),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      title,
+                      style: const TextStyle(
+                        fontSize: 18,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subtitle,
+                      style: TextStyle(
+                        fontSize: 14,
+                        color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                Icons.arrow_forward_ios,
+                size: 20,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showPanicConfirmation() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Row(
+          children: [
+            Icon(Icons.warning, color: Colors.red[700], size: 32),
+            const SizedBox(width: 10),
+            const Text('Panic Alert'),
+          ],
+        ),
+        content: const Text(
+          'This will send an emergency alert to all residents and administration.\n\nAre you sure?',
+          style: TextStyle(fontSize: 16),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCEL', style: TextStyle(fontSize: 16)),
+          ),
+          FilledButton(
+            onPressed: () {
+              Navigator.pop(context);
+              _triggerPanic();
+            },
+            style: FilledButton.styleFrom(backgroundColor: Colors.red),
+            child: const Text('SEND ALERT', style: TextStyle(fontSize: 16)),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _triggerPanic() async {
+    try {
+      final guardData = await _authService.getResidentData();
+
+      String apartmentId = guardData!['apartmentName']
+          .toString()
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+      // Create panic alert in apartment-specific collection for guards and residents in same apartment
+      await FirebaseFirestore.instance
+          .collection('apartments')
+          .doc(apartmentId)
+          .collection('panic_alerts')
+          .add({
+            'guardId': guardData!['uid'],
+            'guardName': guardData['residentName'],
+            'apartmentName': guardData['apartmentName'],
+            'timestamp': FieldValue.serverTimestamp(),
+            'status': 'active',
+            'message': 'Emergency at gate - Guard requires assistance',
+          });
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Row(
+            children: [
+              Icon(Icons.warning, color: Colors.white, size: 28),
+              SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  'PANIC ALERT SENT!\nAll residents have been notified.',
+                  style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ],
+          ),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 5),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Error sending alert: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _showResidentPanicNotification(
+    Map<String, dynamic> alert,
+  ) async {
+    const AndroidNotificationDetails androidPlatformChannelSpecifics =
+        AndroidNotificationDetails(
+          'resident_panic_channel',
+          'Resident Emergency Alerts',
+          channelDescription: 'Emergency alerts from residents',
+          importance: Importance.max,
+          priority: Priority.high,
+          sound: RawResourceAndroidNotificationSound('siren'),
+          playSound: true,
+          ongoing: true, // Make notification persistent
+          autoCancel: false, // Don't auto-cancel when tapped
+        );
+
+    const NotificationDetails platformChannelSpecifics = NotificationDetails(
+      android: androidPlatformChannelSpecifics,
+    );
+
+    final payload = jsonEncode({
+      'type': 'resident_panic',
+      'alertId': alert['id'] ?? '',
+    });
+
+    await _flutterLocalNotificationsPlugin.show(
+      1, // Different ID from panic alerts
+      '🚨 RESIDENT EMERGENCY! 🚨',
+      'Emergency alert from ${alert['residentName']} (Apt ${alert['apartmentNumber']})',
+      platformChannelSpecifics,
+      payload: payload,
+    );
+
+    // Start repeating the notification sound every 3 seconds
+    _startResidentPanicNotificationRepeating(payload);
+  }
+
+  Future<void> _showGuardPanicNotification(Map<String, dynamic> alert) async {
+    const AndroidNotificationDetails androidPlatformChannelSpecifics =
+        AndroidNotificationDetails(
+          'guard_panic_channel',
+          'Guard Emergency Alerts',
+          channelDescription: 'Emergency alerts from guards',
+          importance: Importance.max,
+          priority: Priority.high,
+          sound: RawResourceAndroidNotificationSound('siren'),
+          playSound: true,
+          ongoing: true,
+          autoCancel: false,
+        );
+
+    const NotificationDetails platformChannelSpecifics = NotificationDetails(
+      android: androidPlatformChannelSpecifics,
+    );
+
+    final payload = jsonEncode({
+      'type': 'guard_panic',
+      'alertId': alert['id'] ?? '',
+    });
+
+    await _flutterLocalNotificationsPlugin.show(
+      2, // Different ID from resident panic alerts
+      '🚨 GUARD EMERGENCY! 🚨',
+      'Emergency alert from ${alert['guardName'] ?? 'Guard'} - Immediate assistance required!',
+      platformChannelSpecifics,
+      payload: payload,
+    );
+
+    // Start repeating the notification sound every 3 seconds
+    _startGuardPanicNotificationRepeating(payload);
+  }
+
+  Future<void> _acknowledgeAlert(String alertId) async {
+    try {
+      if (guardData == null || guardData!['apartmentName'] == null) return;
+
+      String apartmentId = guardData!['apartmentName']
+          .toString()
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+      await FirebaseFirestore.instance
+          .collection('apartments')
+          .doc(apartmentId)
+          .collection('resident_panic_alerts')
+          .doc(alertId)
+          .update({'status': 'acknowledged'});
+
+      // Remove from notified alerts set so it can be notified again if needed
+      _notifiedAlertIds.remove(alertId);
+
+      // Stop resident panic notifications when acknowledging resident emergency
+      await _notificationService.stopPanicNotifications();
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Alert acknowledged successfully'),
+          backgroundColor: Colors.green,
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Failed to acknowledge alert: $e'),
+          backgroundColor: Colors.red,
+        ),
+      );
+    }
+  }
+
+  Future<void> _resolveGuardAlert(String alertId) async {
+    try {
+      if (guardData == null || guardData!['apartmentName'] == null) return;
+
+      String apartmentId = guardData!['apartmentName']
+          .toString()
+          .toLowerCase()
+          .replaceAll(RegExp(r'[^a-z0-9]'), '');
+
+      await FirebaseFirestore.instance
+          .collection('apartments')
+          .doc(apartmentId)
+          .collection('panic_alerts')
+          .doc(alertId)
+          .update({
+            'status': 'resolved',
+            'resolvedAt': FieldValue.serverTimestamp(),
+            'resolvedBy': guardData!['uid'],
+            'resolvedByName': guardData!['residentName'],
+          });
+
+      // Stop panic notifications when resolving guard emergency
+      await _notificationService.stopPanicNotifications();
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Row(
+            children: [
+              Icon(Icons.check_circle, color: Colors.white),
+              SizedBox(width: 12),
+              Text('Security emergency resolved successfully'),
+            ],
+          ),
+          backgroundColor: Colors.green.shade600,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error, color: Colors.white),
+              const SizedBox(width: 12),
+              Expanded(child: Text('Failed to resolve alert: $e')),
+            ],
+          ),
+          backgroundColor: Colors.red.shade600,
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+        ),
+      );
+    }
+  }
+
+  void _handleLogout() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Logout'),
+        content: const Text(
+          'Are you sure you want to logout?',
+          style: TextStyle(fontSize: 16),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('CANCEL', style: TextStyle(fontSize: 16)),
+          ),
+          TextButton(
+            onPressed: () async {
+              await _authService.logout();
+              if (!mounted) return;
+              Navigator.of(context).pop();
+              Navigator.of(context).pushReplacementNamed('/');
+            },
+            child: Text(
+              'LOGOUT',
+              style: TextStyle(fontSize: 16, color: Colors.red[700]),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _startResidentPanicNotificationRepeating(String? payload) {
+    // Stop any existing panic notification timer
+    _stopPanicNotifications();
+
+    _isPanicNotificationActive = true;
+
+    // Create repeating notification that plays sound every 3 seconds
+    _panicNotificationTimer = Timer.periodic(const Duration(seconds: 3), (
+      timer,
+    ) {
+      if (!_isPanicNotificationActive) {
+        timer.cancel();
+        return;
+      }
+
+      const AndroidNotificationDetails androidPlatformChannelSpecifics =
+          AndroidNotificationDetails(
+            'resident_panic_channel',
+            'Resident Emergency Alerts',
+            channelDescription: 'Emergency alerts from residents',
+            importance: Importance.max,
+            priority: Priority.high,
+            sound: RawResourceAndroidNotificationSound('siren'),
+            playSound: true,
+            ongoing: true,
+            autoCancel: false,
+          );
+
+      const NotificationDetails platformChannelSpecifics = NotificationDetails(
+        android: androidPlatformChannelSpecifics,
+      );
+
+      // Use a different ID each time to force the sound to play
+      final notificationId = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+      _flutterLocalNotificationsPlugin.show(
+        notificationId,
+        '🚨 RESIDENT EMERGENCY! 🚨',
+        'Emergency alert from resident. Immediate response required!',
+        platformChannelSpecifics,
+        payload: payload,
+      );
+    });
+  }
+
+  void _startGuardPanicNotificationRepeating(String? payload) {
+    // Stop any existing panic notification timer
+    _stopPanicNotifications();
+
+    _isPanicNotificationActive = true;
+
+    // Create repeating notification that plays sound every 3 seconds
+    _panicNotificationTimer = Timer.periodic(const Duration(seconds: 3), (
+      timer,
+    ) {
+      if (!_isPanicNotificationActive) {
+        timer.cancel();
+        return;
+      }
+
+      const AndroidNotificationDetails androidPlatformChannelSpecifics =
+          AndroidNotificationDetails(
+            'guard_panic_channel',
+            'Guard Emergency Alerts',
+            channelDescription: 'Emergency alerts from guards',
+            importance: Importance.max,
+            priority: Priority.high,
+            sound: RawResourceAndroidNotificationSound('siren'),
+            playSound: true,
+            ongoing: true,
+            autoCancel: false,
+          );
+
+      const NotificationDetails platformChannelSpecifics = NotificationDetails(
+        android: androidPlatformChannelSpecifics,
+      );
+
+      // Use a different ID each time to force the sound to play
+      final notificationId =
+          DateTime.now().millisecondsSinceEpoch ~/ 1000 +
+          1000; // Offset to avoid conflicts
+
+      _flutterLocalNotificationsPlugin.show(
+        notificationId,
+        '🚨 GUARD EMERGENCY! 🚨',
+        'Emergency alert from guard. Immediate assistance required!',
+        platformChannelSpecifics,
+        payload: payload,
+      );
+    });
+  }
+
+  void _stopPanicNotifications() {
+    _isPanicNotificationActive = false;
+    _panicNotificationTimer?.cancel();
+    _panicNotificationTimer = null;
+
+    // Cancel specific panic notification IDs instead of all notifications
+    _flutterLocalNotificationsPlugin.cancel(0); // Resident panic notification
+    _flutterLocalNotificationsPlugin.cancel(2); // Guard panic notification
+
+    // Cancel any repeating notifications by cancelling recent high IDs
+    final now = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+    // Cancel notifications from the last 5 minutes that might be repeating
+    for (int i = 0; i < 300; i++) {
+      _flutterLocalNotificationsPlugin.cancel(now - i);
+      _flutterLocalNotificationsPlugin.cancel(
+        (now - i) + 1000,
+      ); // Guard panic offset
+    }
+  }
+}

@@ -1,0 +1,55 @@
+{
+  "flutter": {
+    "platforms": {
+      "android": {
+        "default": {
+          "projectId": "safegate-visitor-app",
+          "appId": "1:212560735888:android:5daf0368a01a5c9b67f215",
+          "fileOutput": "android/app/google-services.json"
+        }
+      },
+      "dart": {
+        "lib/firebase_options.dart": {
+          "projectId": "safegate-visitor-app",
+          "configurations": {
+            "android": "1:212560735888:android:5daf0368a01a5c9b67f215",
+            "ios": "1:212560735888:ios:c14b66eedb6bcd1767f215",
+            "macos": "1:212560735888:ios:c14b66eedb6bcd1767f215",
+            "web": "1:212560735888:web:9fa0b2dafe5e17be67f215",
+            "windows": "1:212560735888:web:13e2b88171e2178f67f215"
+          }
+        }
+      }
+    }
+  },
+  "functions": [
+    {
+      "codebase": "default",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [],
+      "source": "functions"
+    },
+    {
+      "source": "passwordchanfe",
+      "codebase": "passwordchanfe",
+      "disallowLegacyRuntimeConfig": true,
+      "ignore": [
+        "node_modules",
+        ".git",
+        "firebase-debug.log",
+        "firebase-debug.*.log",
+        "*.local"
+      ],
+      "predeploy": [
+        "npm --prefix \"$RESOURCE_DIR\" run lint"
+      ]
+    }
+  ]
+}
